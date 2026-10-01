@@ -1,0 +1,21 @@
+# Secrets -- NEVER commit these
+.env
+*.env
+!.env.example
+
+# Bot runtime artifacts (local audit trail, not source)
+run_log.jsonl
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
+.idea/
+test_bot.py

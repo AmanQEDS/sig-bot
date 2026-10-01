@@ -1,0 +1,71 @@
+name: SIG bot scan/trade
+
+on:
+  # Runs every 2 hours. GitHub Actions cron can't be bounded to a date range
+  # directly, so bot.py's own COMPETITION_START/COMPETITION_END guard (see
+  # bot.py) refuses to place live orders outside Oct 1 - Nov 4, 2026 --
+  # you don't need to remember to disable this workflow after the
+  # competition ends, though it's still good practice to do so.
+  schedule:
+    - cron: "0 */2 * * *"
+  # Lets you trigger a run manually from the Actions tab, and choose
+  # scan-only vs. live for that one run.
+  workflow_dispatch:
+    inputs:
+      live:
+        description: "Place real orders this run? (type: true or false)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot (scan-only, scheduled)
+        if: github.event_name == 'schedule'
+        env:
+          SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
+          SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
+        run: |
+          python bot.py scan --tournament "$SIG_TOURNAMENT_SLUG" \
+            --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 25
+
+      - name: Run bot (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
+          SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
+          # Only present at all when you deliberately type "true" in the
+          # manual trigger's input -- this is the one place this value is
+          # ever set, and it's never stored as a secret/var, only passed for
+          # this one run.
+          SIG_BOT_CONFIRM_LIVE: ${{ github.event.inputs.live == 'true' && 'YES-I-UNDERSTAND-THIS-IS-LIVE' || '' }}
+        run: |
+          if [ "${{ github.event.inputs.live }}" = "true" ]; then
+            python bot.py trade --tournament "$SIG_TOURNAMENT_SLUG" \
+              --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 10 --live
+          else
+            python bot.py scan --tournament "$SIG_TOURNAMENT_SLUG" \
+              --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 25
+          fi
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-log-${{ github.run_id }}
+          path: run_log.jsonl
+          if-no-files-found: ignore
