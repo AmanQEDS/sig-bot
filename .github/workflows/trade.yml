@@ -50,8 +50,18 @@ jobs:
           SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
         run: |
           local_weekday="$(TZ=America/New_York date +%u)"
+          local_date="$(TZ=America/New_York date +%F)"
           local_hhmm="$(TZ=America/New_York date +%H%M)"
           echo "New York market time: $(TZ=America/New_York date '+%A %H:%M %Z')"
+          if [[ "$local_date" < "2026-10-01" || "$local_date" > "2026-11-04" ]]; then
+            echo "Outside competition dates (Oct 1-Nov 4, 2026 Eastern); skipping."
+            exit 0
+          fi
+          if { [ "$local_date" = "2026-10-01" ] && [ "$local_hhmm" -lt 1200 ]; } ||
+             { [ "$local_date" = "2026-11-04" ] && [ "$local_hhmm" -ge 1200 ]; }; then
+            echo "Outside competition hours (noon Eastern start/end); skipping."
+            exit 0
+          fi
           if [ "$local_weekday" -gt 5 ] || [ "$local_hhmm" -lt 0930 ] || [ "$local_hhmm" -ge 1600 ]; then
             echo "Outside weekday U.S. market hours (9:30am-4:00pm Eastern); skipping."
             exit 0

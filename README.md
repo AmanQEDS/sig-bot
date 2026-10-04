@@ -170,9 +170,10 @@ recommended free setup is a **scheduled** run, not a persistent one:
 
 Already included: `.github/workflows/trade.yml`. It runs a read-only
 `bot.py scan` hourly on weekdays, starting at 9:30 a.m. Eastern and ending
-with the 3:30 p.m. Eastern scan. The workflow handles daylight-saving time
-and lets you trigger a one-off `trade` (dry-run or `--live`) manually from
-the Actions tab.
+with the 3:30 p.m. Eastern scan, only during the competition window (noon
+Eastern Oct 1 through noon Eastern Nov 4, 2026). The workflow handles
+daylight-saving time and lets you trigger a one-off `trade` (dry-run or
+`--live`) manually from the Actions tab.
 
 Setup:
 1. Push this repo to GitHub (Section 10).
