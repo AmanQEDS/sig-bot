@@ -168,9 +168,11 @@ recommended free setup is a **scheduled** run, not a persistent one:
 
 ### Option A — GitHub Actions (recommended, free, no server to manage)
 
-Already included: `.github/workflows/trade.yml`. It runs `bot.py scan` every
-2 hours automatically, and lets you trigger a one-off `trade` (dry-run or
-`--live`) manually from the Actions tab.
+Already included: `.github/workflows/trade.yml`. It runs a read-only
+`bot.py scan` hourly on weekdays, starting at 9:30 a.m. Eastern and ending
+with the 3:30 p.m. Eastern scan. The workflow handles daylight-saving time
+and lets you trigger a one-off `trade` (dry-run or `--live`) manually from
+the Actions tab.
 
 Setup:
 1. Push this repo to GitHub (Section 10).
@@ -193,9 +195,12 @@ Setup:
    doing this — it means every scheduled tick can place real orders
    unattended.
 
-Cron syntax (`0 */2 * * *` = every 2 hours) is in the workflow file; change
-it to whatever cadence you want. GitHub Actions' free tier comfortably
-covers this usage for a public repo, and is generous even for a private one.
+The scheduled workflow requires `SIG_API_KEY`; without that Actions secret,
+the run stops with a clear configuration error before contacting the API.
+Its UTC cron opens a broad window, and a New York local-time check limits
+actual scans to weekday market hours across daylight-saving changes. GitHub
+Actions' free tier comfortably covers this usage for a public repo, and is
+generous even for a private one.
 
 ### Option B — An always-on worker (Railway, Render, Fly.io free tiers, etc.)
 

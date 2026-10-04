@@ -1,19 +1,15 @@
-name: SIG bot scan/trade
+﻿name: SIG bot scan/trade
 
 on:
-  # Runs every 2 hours. GitHub Actions cron can't be bounded to a date range
-  # directly, so bot.py's own COMPETITION_START/COMPETITION_END guard (see
-  # bot.py) refuses to place live orders outside Oct 1 - Nov 4, 2026 --
-  # you don't need to remember to disable this workflow after the
-  # competition ends, though it's still good practice to do so.
+  # Cron is UTC. This broad weekday window covers 9:30am-4pm US Eastern in
+  # both DST and standard time; the scheduled step below gates by local time.
   schedule:
-    - cron: "0 */2 * * *"
-  # Lets you trigger a run manually from the Actions tab, and choose
-  # scan-only vs. live for that one run.
+    - cron: "30 13-21 * * 1-5"
+
   workflow_dispatch:
     inputs:
       live:
-        description: "Place real orders this run? (type: true or false)"
+        description: "Place real orders this run? Type true or false"
         required: true
         default: "false"
 
@@ -22,49 +18,82 @@ permissions:
 
 jobs:
   run-bot:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      - name: Run bot (scan-only, scheduled)
+      - name: Validate API configuration
+        env:
+          SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
+        run: |
+          if [ -z "$SIG_API_KEY" ]; then
+            echo "::error::SIG_API_KEY is not configured. Add it in Settings > Secrets and variables > Actions > New repository secret."
+            exit 1
+          fi
+          echo "SIG_API_KEY is configured."
+
+      - name: Run scheduled scan
         if: github.event_name == 'schedule'
         env:
           SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
           SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
         run: |
-          python bot.py scan --tournament "$SIG_TOURNAMENT_SLUG" \
-            --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 25
+          local_weekday="$(TZ=America/New_York date +%u)"
+          local_hhmm="$(TZ=America/New_York date +%H%M)"
+          echo "New York market time: $(TZ=America/New_York date '+%A %H:%M %Z')"
+          if [ "$local_weekday" -gt 5 ] || [ "$local_hhmm" -lt 0930 ] || [ "$local_hhmm" -ge 1600 ]; then
+            echo "Outside weekday U.S. market hours (9:30am-4:00pm Eastern); skipping."
+            exit 0
+          fi
+          python bot.py scan \
+            --tournament "$SIG_TOURNAMENT_SLUG" \
+            --beliefs beliefs.json \
+            --min-price 0.30 \
+            --max-price 0.70 \
+            --top 25
 
-      - name: Run bot (manual trigger)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Run manual scan
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.live != 'true'
         env:
           SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
           SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
-          # Only present at all when you deliberately type "true" in the
-          # manual trigger's input -- this is the one place this value is
-          # ever set, and it's never stored as a secret/var, only passed for
-          # this one run.
-          SIG_BOT_CONFIRM_LIVE: ${{ github.event.inputs.live == 'true' && 'YES-I-UNDERSTAND-THIS-IS-LIVE' || '' }}
         run: |
-          if [ "${{ github.event.inputs.live }}" = "true" ]; then
-            python bot.py trade --tournament "$SIG_TOURNAMENT_SLUG" \
-              --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 10 --live
-          else
-            python bot.py scan --tournament "$SIG_TOURNAMENT_SLUG" \
-              --beliefs beliefs.json --min-price 0.30 --max-price 0.70 --top 25
-          fi
+          python bot.py scan \
+            --tournament "$SIG_TOURNAMENT_SLUG" \
+            --beliefs beliefs.json \
+            --min-price 0.30 \
+            --max-price 0.70 \
+            --top 25
+
+      - name: Run manual live trade
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.live == 'true'
+        env:
+          SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
+          SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG }}
+          SIG_BOT_CONFIRM_LIVE: YES-I-UNDERSTAND-THIS-IS-LIVE
+        run: |
+          python bot.py trade \
+            --tournament "$SIG_TOURNAMENT_SLUG" \
+            --beliefs beliefs.json \
+            --min-price 0.30 \
+            --max-price 0.70 \
+            --top 10 \
+            --live
 
       - name: Upload run log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: run-log-${{ github.run_id }}
           path: run_log.jsonl

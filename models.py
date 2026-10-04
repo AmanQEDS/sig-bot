@@ -13,7 +13,10 @@ reason about independently of the API layer.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
+from datetime import date
+from typing import Optional
 
 
 # ----------------------------------------------------------------------
@@ -106,6 +109,73 @@ def logit_stack(estimates: dict[str, float], weights: dict[str, float]) -> float
         raise ValueError("No usable estimates/weights supplied to logit_stack().")
     z /= total_w
     return inv_logit(z)
+
+
+# ----------------------------------------------------------------------
+# Poll -> win probability  (FIX: a poll's vote share is NOT a win probability)
+# ----------------------------------------------------------------------
+# A candidate polling 52% of the two-party vote wins roughly 70-75% of the
+# time, not 52%. The old code fed vote share straight into the ensemble as if
+# it were P(win), which drags every race toward 50% and manufactures fake edges
+# against any market priced away from 50%.
+
+POLL_SYSTEMATIC_SD = 0.05      # polling error on the margin ~5 weeks out
+POLL_DESIGN_EFFECT = 2.0       # real-world polls are ~half as informative as n suggests
+MODEL_ERROR_SD = 0.05          # irreducible error of any 2+ source model
+SINGLE_SOURCE_ERROR_SD = 0.08  # when only one independent source exists
+MAX_HISTORICAL_WEIGHT = 0.05   # a decades-old base rate must never drive a trade
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def poll_win_probability(support_fraction: float, opponent_fraction: float,
+                         n_reported: int) -> float:
+    """P(candidate wins) implied by ONE poll, from the two-party margin."""
+    total = support_fraction + opponent_fraction
+    if total <= 0:
+        raise ValueError("support_fraction + opponent_fraction must be > 0")
+    margin = (support_fraction - opponent_fraction) / total
+    n_eff = max(n_reported / POLL_DESIGN_EFFECT, 1.0)
+    sd = math.sqrt(POLL_SYSTEMATIC_SD ** 2 + 1.0 / n_eff)
+    return norm_cdf(margin / sd)
+
+
+def aggregate_poll_probability(polls: list[dict], as_of: Optional[date] = None,
+                               half_life_days: float = 14.0) -> Optional[float]:
+    """Weighted AVERAGE (log-odds) of per-poll win probabilities, recency-decayed.
+    Averaging, not accumulating pseudo-counts, so five correlated polls do not
+    look like five independent confirmations. Polls without 'opponent_fraction'
+    are skipped (a one-sided number cannot give a margin)."""
+    num = den = 0.0
+    for p in polls:
+        opp = p.get("opponent_fraction")
+        if opp is None:
+            continue
+        prob = poll_win_probability(p["support_fraction"], opp, p["n_reported"])
+        w = float(p["n_reported"])
+        d = p.get("date")
+        if d and as_of:
+            try:
+                age = (as_of - date.fromisoformat(d)).days
+                w *= 0.5 ** (max(age, 0) / half_life_days)
+            except ValueError:
+                pass
+        num += w * logit(prob)
+        den += w
+    return inv_logit(num / den) if den > 0 else None
+
+
+def model_uncertainty(estimates: dict) -> tuple[float, int]:
+    """Returns (sigma, n_independent_sources).
+    sigma = irreducible model error combined with how much the sources disagree.
+    The old sigma was the Beta posterior SD (~0.01-0.02), which made the
+    no-trade zone almost vanish and let noise through as 'edge'."""
+    indep = [p for k, p in estimates.items() if k != "beta" and p is not None]
+    disp = statistics.pstdev(indep) if len(indep) >= 2 else 0.0
+    base = MODEL_ERROR_SD if len(indep) >= 2 else SINGLE_SOURCE_ERROR_SD
+    return math.sqrt(base ** 2 + disp ** 2), len(indep)
 
 
 # ----------------------------------------------------------------------

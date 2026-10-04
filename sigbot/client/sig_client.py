@@ -1,51 +1,44 @@
 """
-sig_client.py
---------------
-Thin, safe wrapper around the Super Market trading API (Susquehanna Predictions Cup).
+sigbot.client.sig_client
+------------------------
+Full-featured, rate-limited client for the Super Market API v1 (Predictions Cup).
 
-Every endpoint used here comes directly from the platform's own OpenAPI spec
-(api-1.json), not from guessing. See README.md for how to get an API key.
-
-Design rules baked in, per the spec:
-  - Auth: `Authorization: Bearer <key>` header.
-  - Every error response has shape {"error": {"code", "message", "details"}}.
-    We branch on `code`, never on `message`.
-  - 429 RATE_LIMITED, 503 TX_CONFLICT, 503 SERVICE_UNAVAILABLE -> retry with
-    exponential backoff.
-  - 409 REQUEST_IN_FLIGHT -> wait ~90s, retry the identical payload.
-  - 502 ORDER_STATUS_UNKNOWN -> the order may already have gone through; caller
-    should reconcile against positions before blindly retrying.
-  - Every order-placing call requires a client-supplied idempotencyKey. We
-    generate one deterministically so retries are naturally safe.
-  - Do NOT auto-retry any other 4xx (400/403/404) -- those are real problems.
+Enforces:
+  - Global shared token bucket rate limiter (100 reads/30 writes per min, ~80% target).
+  - Retries on 429 RATE_LIMITED, 503 TX_CONFLICT, 503 SERVICE_UNAVAILABLE.
+  - 409 REQUEST_IN_FLIGHT -> wait 90s lease, retry identical payload.
+  - 502 ORDER_STATUS_UNKNOWN -> raises OrderStatusUnknown (requires position reconciliation).
+  - Strict tick snapping to 0.005 on [0.005, 0.995].
+  - Deterministic idempotency keys.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import random
 import time
 import uuid
-import random
-import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import requests
 
-from sigbot.client.ratelimit import get_rate_limiter, PlatformRateLimiter
+from sigbot.client.ratelimit import PlatformRateLimiter, get_rate_limiter
 
-log = logging.getLogger("sig_client")
+log = logging.getLogger("sigbot.client")
 
 DEFAULT_BASE_URL = "https://www.thesuper.market/api/v1"
 TICK = 0.005
 
 
 def snap_to_tick(price: float) -> float:
-    """Limit prices must be on the 0.005 tick between 0.005 and 0.995 (spec).
-    price 0 / 1 are the market-order encodings and are passed through untouched."""
+    """Limit prices must be on the 0.005 tick between 0.005 and 0.995.
+    Price 0 / 1 are market order encodings and are passed through untouched."""
     if price <= 0.0 or price >= 1.0:
         return price
     return round(min(max(round(price / TICK) * TICK, 0.005), 0.995), 3)
+
 
 RETRYABLE_CODES = {"RATE_LIMITED", "TX_CONFLICT", "SERVICE_UNAVAILABLE"}
 IN_FLIGHT_CODE = "REQUEST_IN_FLIGHT"
@@ -53,7 +46,7 @@ UNKNOWN_STATUS_CODE = "ORDER_STATUS_UNKNOWN"
 
 
 class SigApiError(Exception):
-    """Raised for non-retryable API errors (bad input, auth, scope, not found...)."""
+    """Raised for non-retryable API errors (validation, auth, not found, etc.)."""
 
     def __init__(self, code: str, message: str, details: Optional[dict] = None, http_status: int = 0):
         super().__init__(f"[{code}] {message}")
@@ -64,13 +57,12 @@ class SigApiError(Exception):
 
 
 class OrderStatusUnknown(Exception):
-    """Raised for 502 ORDER_STATUS_UNKNOWN -- caller MUST reconcile against
-    positions before deciding whether to retry."""
+    """Raised for 502 ORDER_STATUS_UNKNOWN -- caller MUST reconcile positions before retry."""
 
     def __init__(self, idempotency_key: str):
         super().__init__(
             f"Order status unknown for idempotencyKey={idempotency_key}. "
-            "Check GET /portfolio/positions before retrying."
+            "Check positions before retrying."
         )
         self.idempotency_key = idempotency_key
 
@@ -79,9 +71,10 @@ class OrderStatusUnknown(Exception):
 class SigClient:
     api_key: str
     base_url: str = DEFAULT_BASE_URL
-    tournament_id: Optional[str] = None  # resolved once at startup, see resolve_tournament()
+    tournament_id: Optional[str] = None
     max_retries: int = 6
     timeout: float = 60.0
+    rate_limiter: PlatformRateLimiter = field(default_factory=get_rate_limiter)
 
     def __post_init__(self):
         self._session = requests.Session()
@@ -89,23 +82,28 @@ class SigClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         })
-        self.rate_limiter = get_rate_limiter()
 
-    # ------------------------------------------------------------------
-    # Low-level request helper with the spec's retry rules baked in
-    # ------------------------------------------------------------------
-    def _request(self, method: str, path: str, *, params: dict | None = None,
-                 json_body: dict | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        json_body: dict | None = None,
+    ) -> Any:
         url = f"{self.base_url}{path}"
-        op = "read" if method.upper() in ("GET", "HEAD") else "write"
-        self.rate_limiter.acquire(op, n=1)
+        op_kind = "read" if method.upper() in ("GET", "HEAD") else "write"
+
+        # Rate-limiting gate: acquire token before making the call
+        self.rate_limiter.acquire(op_kind, n=1)
 
         attempt = 0
         while True:
             attempt += 1
             try:
-                resp = self._session.request(method, url, params=params, json=json_body,
-                                            timeout=self.timeout)
+                resp = self._session.request(
+                    method, url, params=params, json=json_body, timeout=self.timeout
+                )
             except requests.exceptions.Timeout:
                 if attempt <= self.max_retries:
                     backoff = min(0.5 * (2 ** (attempt - 1)), 30.0) + random.uniform(0, 0.5)
@@ -114,45 +112,43 @@ class SigClient:
                     continue
                 raise
             except requests.exceptions.ConnectionError as exc:
-                # "Connection forcibly closed" crashed whole scans before. Reads are
-                # safe to retry. For POSTs the order may or may not have landed, so
-                # surface it for reconciliation instead of guessing.
-                if method == "GET" and attempt <= self.max_retries:
+                if method.upper() == "GET" and attempt <= self.max_retries:
                     backoff = min(1.0 * (2 ** (attempt - 1)), 30.0) + random.uniform(0, 0.5)
                     log.warning("Connection error (attempt %d), backing off %.2fs", attempt, backoff)
                     time.sleep(backoff)
                     continue
-                if method == "POST" and json_body and json_body.get("idempotencyKey"):
+                if method.upper() == "POST" and json_body and json_body.get("idempotencyKey"):
                     raise OrderStatusUnknown(json_body["idempotencyKey"]) from exc
                 raise SigApiError("REQUEST_ERROR", str(exc), http_status=0) from exc
             except requests.exceptions.RequestException as exc:
                 raise SigApiError("REQUEST_ERROR", str(exc), http_status=0) from exc
+
             if resp.status_code < 400:
                 if resp.status_code == 204 or not resp.content:
                     return None
                 return resp.json()
 
-            # Try to parse the stable error envelope
+            # Parse error envelope
             try:
                 err = resp.json().get("error", {})
             except ValueError:
                 err = {"code": "UNKNOWN", "message": resp.text}
+
             code = err.get("code", "UNKNOWN")
             message = err.get("message", "")
             details = err.get("details", {})
 
             if resp.status_code == 502 and code == UNKNOWN_STATUS_CODE:
-                # Do not blindly retry -- caller must reconcile positions first.
                 raise OrderStatusUnknown(json_body.get("idempotencyKey", "") if json_body else "")
 
             if code == IN_FLIGHT_CODE:
-                log.warning("REQUEST_IN_FLIGHT -- waiting 90s before retrying same payload")
+                log.warning("REQUEST_IN_FLIGHT: lease active, waiting 90s before retry")
                 time.sleep(90)
                 continue
 
             if code in RETRYABLE_CODES and attempt <= self.max_retries:
                 backoff = min(0.1 * (2 ** (attempt - 1)), 10.0) + random.uniform(0, 0.1)
-                try:   # spec: 429 carries Retry-After: 60 (limits: 100 reads + 30 writes /min /key)
+                try:
                     ra = resp.headers.get("Retry-After")
                     if ra:
                         backoff = min(float(ra), 65.0) + random.uniform(0, 1.0)
@@ -162,19 +158,16 @@ class SigClient:
                 time.sleep(backoff)
                 continue
 
-            # Everything else (400/401/403/404/409-not-in-flight/422/500) is NOT
-            # auto-retried, per the spec's explicit guidance.
             raise SigApiError(code, message, details, resp.status_code)
 
     @staticmethod
     def new_idempotency_key(*parts: str) -> str:
-        """Deterministic-ish idempotency key: stable for retries of the same
-        logical intent, distinct across new intents."""
+        """Deterministic prefix with unique suffix for idempotency."""
         base = "-".join(str(p) for p in parts)
         return f"{base}-{uuid.uuid4().hex[:8]}"
 
     # ------------------------------------------------------------------
-    # Account / tournaments
+    # Account & Tournaments
     # ------------------------------------------------------------------
     def get_account(self) -> dict:
         return self._request("GET", "/account")
@@ -186,15 +179,17 @@ class SigClient:
         return self._request("GET", f"/tournaments/{slug}")
 
     def resolve_tournament(self, slug: str) -> str:
-        """Resolve a tournament slug to its UUID and cache it on this client.
-        Call this once at startup; pass tournament_id explicitly on every
-        subsequent call rather than relying on org-default fallbacks."""
         t = self.get_tournament(slug)
         self.tournament_id = t["id"]
         return self.tournament_id
 
-    def get_leaderboard(self, tournament_slug: str | None = None, period: str = "all",
-                        limit: int = 50, offset: int = 0) -> dict:
+    def get_leaderboard(
+        self,
+        tournament_slug: str | None = None,
+        period: str = "all",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
         params = {"period": period, "limit": limit, "offset": offset}
         if tournament_slug:
             return self._request("GET", f"/tournaments/{tournament_slug}/leaderboard", params=params)
@@ -204,10 +199,15 @@ class SigClient:
         return self._request("GET", f"/tournaments/{tournament_slug}/me/smart-score")
 
     # ------------------------------------------------------------------
-    # Market discovery
+    # Markets & Exchanges
     # ------------------------------------------------------------------
-    def list_markets(self, limit: int = 100, cursor: str | None = None,
-                      status: str | None = "open", search: str | None = None) -> dict:
+    def list_markets(
+        self,
+        limit: int = 100,
+        cursor: str | None = None,
+        status: str | None = "open",
+        search: str | None = None,
+    ) -> dict:
         params: dict[str, Any] = {"limit": limit}
         if self.tournament_id:
             params["tournamentId"] = self.tournament_id
@@ -220,7 +220,6 @@ class SigClient:
         return self._request("GET", "/markets", params=params)
 
     def list_all_markets(self, **kwargs) -> list[dict]:
-        """Paginate through every market via cursor."""
         out: list[dict] = []
         cursor = None
         while True:
@@ -238,26 +237,23 @@ class SigClient:
         params = {"tournamentId": self.tournament_id} if self.tournament_id else None
         return self._request("GET", f"/markets/{market_id}", params=params)
 
-    def get_market_orderbook(self, market_id: str, depth: int = 10) -> dict:
+    def get_market_orderbook(self, market_id: str, depth: int = 20) -> dict:
         params = {"depth": depth}
         if self.tournament_id:
             params["tournamentId"] = self.tournament_id
         return self._request("GET", f"/markets/{market_id}/orderbook", params=params)
 
-    # ------------------------------------------------------------------
-    # Exchanges (the tradable-contract unit)
-    # ------------------------------------------------------------------
     def get_exchange_price(self, exchange_id: str) -> dict:
         params = {"tournamentId": self.tournament_id} if self.tournament_id else None
         return self._request("GET", f"/exchanges/{exchange_id}/price", params=params)
 
-    def get_exchange_orderbook(self, exchange_id: str) -> dict:
-        params = {"tournamentId": self.tournament_id} if self.tournament_id else None
+    def get_exchange_orderbook(self, exchange_id: str, depth: int = 20) -> dict:
+        params = {"depth": depth}
+        if self.tournament_id:
+            params["tournamentId"] = self.tournament_id
         return self._request("GET", f"/exchanges/{exchange_id}/orderbook", params=params)
 
     def bulk_prices(self, exchange_ids: list[str]) -> dict:
-        """Up to 100 exchange ids per call -- the efficient way to scan all
-        ~237 markets in ~3 calls instead of 237."""
         out: dict[str, Any] = {"data": [], "missingIds": []}
         for i in range(0, len(exchange_ids), 100):
             chunk = exchange_ids[i:i + 100]
@@ -269,12 +265,55 @@ class SigClient:
             out["missingIds"].extend(page.get("missingIds", []))
         return out
 
+    def get_exchange_trades(
+        self,
+        exchange_id: str,
+        limit: int = 50,
+        cursor: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if self.tournament_id:
+            params["tournamentId"] = self.tournament_id
+        if cursor:
+            params["cursor"] = cursor
+        if from_ts:
+            params["from"] = from_ts
+        if to_ts:
+            params["to"] = to_ts
+        return self._request("GET", f"/exchanges/{exchange_id}/trades", params=params)
+
+    def get_exchange_price_history(
+        self,
+        exchange_id: str,
+        resolution: str = "1h",
+        limit: int = 200,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"resolution": resolution, "limit": limit}
+        if self.tournament_id:
+            params["tournamentId"] = self.tournament_id
+        if from_ts:
+            params["from"] = from_ts
+        if to_ts:
+            params["to"] = to_ts
+        return self._request("GET", f"/exchanges/{exchange_id}/price-history", params=params)
+
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
-    def place_order(self, exchange_id: str, side: str, action: str, quantity: int,
-                     price: float | None = None, idempotency_key: str | None = None,
-                     expiration_date: str | None = None) -> dict:
+    def place_order(
+        self,
+        exchange_id: str,
+        side: str,
+        action: str,
+        quantity: int,
+        price: float | None = None,
+        idempotency_key: str | None = None,
+        expiration_date: str | None = None,
+    ) -> dict:
         assert side in ("yes", "no")
         assert action in ("buy", "sell")
         body: dict[str, Any] = {
@@ -293,13 +332,27 @@ class SigClient:
         return self._request("POST", "/orders", json_body=body)
 
     def place_batch(self, orders: list[dict], idempotency_key: str | None = None) -> dict:
-        """orders: list of dicts with exchangeId/side/action/quantity/price.
-        Up to 50 per call; partial success is OK (207)."""
+        """Place up to 50 orders in a single request (counts as 1 write)."""
         body = {
             "idempotencyKey": idempotency_key or self.new_idempotency_key("batch"),
             "orders": orders,
         }
         return self._request("POST", "/orders/batch", json_body=body)
+
+    def place_multi_leg(
+        self,
+        legs: list[dict],
+        idempotency_key: str | None = None,
+        relationship_constraint: str | None = None,
+    ) -> dict:
+        """Place up to 10 orders atomically (all or nothing)."""
+        body: dict[str, Any] = {
+            "idempotencyKey": idempotency_key or self.new_idempotency_key("multileg"),
+            "legs": legs,
+        }
+        if relationship_constraint:
+            body["relationshipConstraint"] = relationship_constraint
+        return self._request("POST", "/orders/multi-leg", json_body=body)
 
     def cancel_all(self, exchange_id: str | None = None, market_id: str | None = None) -> dict:
         body: dict[str, Any] = {}
@@ -319,8 +372,14 @@ class SigClient:
             params["tournamentId"] = self.tournament_id
         return self._request("GET", "/orders", params=params)
 
+    def get_order(self, order_id: str | int) -> dict:
+        return self._request("GET", f"/orders/{order_id}")
+
+    def cancel_order(self, order_id: str | int) -> dict:
+        return self._request("DELETE", f"/orders/{order_id}")
+
     # ------------------------------------------------------------------
-    # Portfolio
+    # Portfolio & Relationships
     # ------------------------------------------------------------------
     def get_positions(self) -> dict:
         return self._request("GET", "/portfolio/positions")
@@ -328,14 +387,15 @@ class SigClient:
     def get_pnl(self) -> dict:
         return self._request("GET", "/portfolio/pnl")
 
-    # Explicit tournament scope. NOTE the real response shape (spec):
-    #   positions -> {"positions": [...], "summary": {...}}   (NOT {"data": [...]})
-    #   quantity is SIGNED: >0 = YES shares, <0 = NO shares.
     def get_tournament_positions(self, slug: str) -> dict:
         return self._request("GET", f"/tournaments/{slug}/portfolio/positions")
 
     def get_tournament_pnl(self, slug: str, period: str = "all") -> dict:
         return self._request("GET", f"/tournaments/{slug}/portfolio/pnl", params={"period": period})
+
+    def get_collateral(self) -> dict:
+        params = {"tournamentId": self.tournament_id} if self.tournament_id else None
+        return self._request("GET", "/portfolio/collateral", params=params)
 
     def get_violated_constraints(self, min_violation: float = 0.01) -> dict:
         params: dict[str, Any] = {"violationsOnly": "true", "minViolation": min_violation}
@@ -343,12 +403,25 @@ class SigClient:
             params["tournamentId"] = self.tournament_id
         return self._request("GET", "/relationships/constraints", params=params)
 
-    # ------------------------------------------------------------------
-    # Relationships (native cross-market consistency checking)
-    # ------------------------------------------------------------------
     def get_relationship_constraints(self) -> dict:
         params = {"tournamentId": self.tournament_id} if self.tournament_id else None
         return self._request("GET", "/relationships/constraints", params=params)
+
+    def get_relationships(self, market_id: str | None = None, exchange_id: str | None = None) -> dict:
+        params: dict[str, Any] = {}
+        if market_id:
+            params["marketId"] = market_id
+        if exchange_id:
+            params["exchangeId"] = exchange_id
+        if self.tournament_id:
+            params["tournamentId"] = self.tournament_id
+        return self._request("GET", "/relationships", params=params)
+
+    def get_relationship_graph(self, market_id: str, depth: int = 2) -> dict:
+        params: dict[str, Any] = {"marketId": market_id, "depth": depth}
+        if self.tournament_id:
+            params["tournamentId"] = self.tournament_id
+        return self._request("GET", "/relationships/graph", params=params)
 
     # ------------------------------------------------------------------
     # Realtime
@@ -361,39 +434,19 @@ PLACEHOLDER_KEY = "your-api-key-here"
 
 
 def client_from_env() -> SigClient:
-    """Convenience constructor: reads SIG_API_KEY (required) and SIG_BASE_URL
-    (optional) from the environment.
-
-    If a `.env` file exists in the current working directory and
-    python-dotenv is installed, it is loaded first (for local development
-    only -- .env is git-ignored and must never be committed). We explicitly
-    search from the current working directory (usecwd=True) rather than
-    relying on python-dotenv's default stack-frame-based detection, which is
-    unreliable on some Windows setups (it can silently fail to find a .env
-    sitting right next to the script). In CI/cloud deployments, set
-    SIG_API_KEY as a real secret/environment variable instead of a .env file.
-    """
     api_key = os.environ.get("SIG_API_KEY")
     if not api_key or api_key.strip() == PLACEHOLDER_KEY:
         try:
-            from dotenv import load_dotenv, find_dotenv  # type: ignore
+            from dotenv import load_dotenv, find_dotenv
             dotenv_path = find_dotenv(usecwd=True)
             if dotenv_path:
                 load_dotenv(dotenv_path, override=False)
         except ImportError:
-            pass  # dotenv is optional; fine if the env var is already set another way
+            pass
         api_key = os.environ.get("SIG_API_KEY")
     if not api_key:
-        raise RuntimeError(
-            "SIG_API_KEY is not set. Locally: put it in a .env file (git-ignored) "
-            "or `export SIG_API_KEY=...`. In CI/cloud: set it as a secret/environment "
-            "variable -- see README.md's 'Deploying' section."
-        )
+        raise RuntimeError("SIG_API_KEY is not set.")
     if api_key.strip() == PLACEHOLDER_KEY:
-        raise RuntimeError(
-            f"SIG_API_KEY is still set to the placeholder value '{PLACEHOLDER_KEY}'. "
-            "Open .env and replace it with your real key from Settings -> API Keys "
-            "on the platform, then save the file and try again."
-        )
+        raise RuntimeError(f"SIG_API_KEY is still set to placeholder '{PLACEHOLDER_KEY}'.")
     base_url = os.environ.get("SIG_BASE_URL", DEFAULT_BASE_URL)
     return SigClient(api_key=api_key, base_url=base_url)

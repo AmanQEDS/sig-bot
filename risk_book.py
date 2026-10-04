@@ -56,7 +56,7 @@ class RiskBook:
         self.group_exposure.clear()
         self.total_deployed = 0.0
         for p in positions:
-            exid = p.get("exchangeId")
+            exid = str(p.get("exchangeId"))   # ids can be int in one API and str in another
             group = group_of_exchange.get(exid, "ungrouped")
             cost = abs(p.get("costBasis", 0.0))
             self.group_exposure[group] = self.group_exposure.get(group, 0.0) + cost

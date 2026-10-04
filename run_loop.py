@@ -69,7 +69,7 @@ def main() -> None:
             if args.live:
                 cmd_trade(client, args.tournament, args.beliefs,
                           (args.min_price, args.max_price), args.top, True,
-                          not args.full_kelly, 0.05, 0.15, 0.70, 10)
+                          not args.full_kelly, 0.03, 0.15, 0.70, 10)
             else:
                 cmd_scan(client, args.tournament, args.beliefs,
                          (args.min_price, args.max_price), args.top)

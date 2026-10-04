@@ -1,0 +1,122 @@
+{
+  "_README": "One entry per market you've researched. Match by 'title_contains' (case-insensitive substring match against the market title from GET /markets) since exchangeId/marketId are not known until the bot lists markets. 'group' is used for correlation-exposure capping in bot.py -- give correlated markets (same state, same chamber-control theme, same national-environment bucket) the same group name. Leave 'polls' empty if you have none yet; the bot will fall back to 'fundamental_p'/'external_p' only. Update this file whenever you do fresh research on a race -- the bot itself never fetches news.",
+
+  "markets": [
+    {
+      "title_contains": "Republican Party win the Alaska Senate",
+      "group": "AK-senate",
+      "verified": true,
+      "polls": [
+        {"support_fraction": 0.47, "n_reported": 800, "source": "AARP/Fabrizio Ward-Impact Research", "date": "2026-09-17"},
+        {"support_fraction": 0.48, "n_reported": 1352, "source": "Alaska Survey Research", "date": "2026-09-22"}
+      ],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 7, "beta": 1, "note": "7 R wins / 1 D win since 1978 -- weak, 48yr-old prior"},
+      "fundamental_p": 0.44,
+      "external_p": 0.43,
+      "external_source": "DecisionDeskHQ blended forecast",
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-09-26",
+      "notes": "Peltola out-raising Sullivan, led the top-four primary. Market ask looks low vs independent sources -- Class E, investigate-then-trade."
+    },
+    {
+      "title_contains": "Will the Republican Party win the Kansas Senate",
+      "group": "KS-senate",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.62,
+      "external_p": 0.60,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden until >=2 sources and verified: true."
+    },
+    {
+      "title_contains": "Will the Democratic Party win the Kansas Senate",
+      "group": "KS-senate",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.38,
+      "external_p": 0.40,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    },
+    {
+      "title_contains": "Will the Republican Party win the WI-01 House race",
+      "group": "WI-01",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.58,
+      "external_p": 0.56,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    },
+    {
+      "title_contains": "Will the Democratic Party win the WI-01 House race",
+      "group": "WI-01",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.42,
+      "external_p": 0.44,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    },
+    {
+      "title_contains": "Will the Democratic Party win the VA-01 House race",
+      "group": "VA-01",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.55,
+      "external_p": 0.53,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    },
+    {
+      "title_contains": "Will the Republican Party win the MI-10 House race",
+      "group": "MI-10",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.57,
+      "external_p": 0.55,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    },
+    {
+      "title_contains": "Will the Democratic Party win the MI-10 House race",
+      "group": "MI-10",
+      "verified": false,
+      "polls": [],
+      "correlation_discount": 4.0,
+      "historical_prior": {"alpha": 1, "beta": 1},
+      "fundamental_p": 0.43,
+      "external_p": 0.45,
+      "sig_p": null,
+      "weights": {"beta": 0.15, "poll": 0.30, "fundamental": 0.20, "external": 0.20, "sig": 0.15},
+      "last_updated": "2026-10-02",
+      "notes": "Unverified starter estimate - trading forbidden."
+    }
+  ]
+}

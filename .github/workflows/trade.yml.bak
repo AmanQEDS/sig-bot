@@ -1,0 +1,95 @@
+name: SIG bot scan/trade
+
+# GitHub Actions cron is ALWAYS UTC -- it cannot take a time zone, so IST (UTC+5:30)
+# times written here would run 5.5 hours off. These entries are UTC, chosen to cover
+# US market hours, when polls and news that move election prices are published:
+#
+#   12:10-23:10 UTC  =  8:10am-7:10pm EDT   (Oct 1 - Nov 1)   /   7:10am-6:10pm EST (from Nov 2)
+#   00:10-02:10 UTC  =  8:10pm-10:10pm EDT                    /   7:10pm-9:10pm EST
+#   i.e. 8am-10pm US Eastern  =  5:40pm-7:40am IST  (Indian time)
+#
+# Competition window (bot.py also enforces this): Oct 1 12:00 ET -> Nov 4 12:00 ET.
+# Scheduled runs are READ-ONLY (scan + consistency + snapshot). Nothing here places an
+# order unless you start it by hand with live=true.
+on:
+  schedule:
+    - cron: "10 12-23 * * *"
+    - cron: "10 0-2 * * *"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "What to run"
+        type: choice
+        default: scan
+        options: [scan, trade, positions, leaderboard, consistency, snapshot]
+      live:
+        description: "trade only: place REAL orders (needs SIG_BOT_CONFIRM_LIVE secret)"
+        type: boolean
+        default: false
+
+# Never let two runs overlap -- overlapping trade runs are how a position gets doubled.
+concurrency:
+  group: sig-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SIG_API_KEY: ${{ secrets.SIG_API_KEY }}
+      SIG_TOURNAMENT_SLUG: ${{ vars.SIG_TOURNAMENT_SLUG || 'midterm-elections' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Self-test (no network)
+        run: python test_bot.py
+
+      - name: Run bot
+        env:
+          EVENT: ${{ github.event_name }}
+          CMD: ${{ github.event.inputs.command || 'scan' }}
+          LIVE: ${{ github.event.inputs.live == 'true' && 'true' || 'false' }}
+          # Only exposed when you explicitly ticked live=true on a manual run.
+          SIG_BOT_CONFIRM_LIVE: ${{ github.event.inputs.live == 'true' && secrets.SIG_BOT_CONFIRM_LIVE || '' }}
+        run: |
+          set -euo pipefail
+          date -u '+UTC now: %F %T'; TZ=America/New_York date '+New York now: %F %T'
+          if [ "$EVENT" = "schedule" ]; then
+            # read-only trio; ~20 API reads total, well inside the 100/min key limit
+            python bot.py scan --beliefs beliefs.json
+            python bot.py consistency
+            python bot.py snapshot
+          else
+            case "$CMD" in
+              scan|positions)  python bot.py "$CMD" --beliefs beliefs.json ;;
+              trade)
+                if [ "$LIVE" = "true" ]; then python bot.py trade --beliefs beliefs.json --live
+                else python bot.py trade --beliefs beliefs.json; fi ;;
+              leaderboard|consistency|snapshot) python bot.py "$CMD" ;;
+              *) echo "unknown command"; exit 1 ;;
+            esac
+          fi
+
+      # Runners are wiped after every run. Positions come from the API (not local files),
+      # so trading is safe on a runner, but keep the logs for audit / strategy research.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sig-bot-${{ github.run_id }}
+          path: |
+            run_log.jsonl
+            snapshots.jsonl
+            market_index.json
+          if-no-files-found: ignore
+          retention-days: 30
